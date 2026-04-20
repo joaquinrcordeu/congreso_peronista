@@ -1,5 +1,6 @@
 import inspect
 import time
+from itertools import product
 from pathlib import Path
 
 import numpy as np
@@ -17,41 +18,59 @@ from sklearn.manifold import TSNE, trustworthiness
 EMB_PATH = "embeddings_intervenciones_spanish_es.npy"
 META_PATH = "embeddings_intervenciones_metadata.csv"
 
-OUT_DIR = Path("tsne_learningrate_full_min40")
+OUT_DIR = Path("tsne_experimentos")
 OUT_DIR.mkdir(exist_ok=True)
 (OUT_DIR / "plots").mkdir(exist_ok=True)
 (OUT_DIR / "coords").mkdir(exist_ok=True)
 
 
 # =========================================================
-# CONFIGURACIÓN
+# CONFIGURACIÓN GENERAL
 # =========================================================
-MIN_PALABRAS = 40
 
-# t-SNE fijo
-PERPLEXITY = 200
-RANDOM_STATE = 42
-EARLY_EXAGGERATION = 12
-N_ITER_LIKE = 1000          # se traduce a max_iter o n_iter según tu versión
-INIT = "pca"
-ANGLE = 0.5
+FILTER_MIN_PALABRAS = 40
 
-# SOLO probás esto
-#LEARNING_RATES = [200, 500, 800, 1000]
-# Si querés incluir auto también:
-LEARNING_RATES = ["auto", 200, 500, 800, 1000]
+# Filtrado opcional por período.
+# Ejemplo: [1946, 1947, 1948]
 
-# PCA previa
-USE_PCA_PRE = True
-PCA_DIM = 50
+FILTER_PERIODOS = None
 
-# Métrica auxiliar
+# Por si no se quiere usar todo.
+# Para correr todo, dejar None.
+SUBSAMPLE_N = None
+
+# Estratificar por grupo para que una submuestra conserve la composición. Si no hay submuestra va False
+STRATIFY_BY_GROUP = False
+
+# PCA previa a t-SNE
+PCA_PRE_TSNE_DIM = 50
+
+# Métrica auxiliar de preservación local
+TRUST_N = 5000
 TRUST_NEIGHBORS = 15
-TRUST_MAX_N = 5000
 
-# Guardado / display
-SAVE_PNG = True
+# Mostrar gráficos en pantalla
 SHOW_PLOTS = False
+
+# Guardar PNG además de SVG
+SAVE_PNG = True
+
+# Semilla base
+RANDOM_STATE_BASE = 42
+
+
+# =========================================================
+# GRID DE PARÁMETROS t-SNE
+# =========================================================
+PARAM_GRID = {
+    "perplexity": [30, 50, 75, 100, 200, 300],
+    "learning_rate": ["auto", 200, 500, 800, 1000],
+    "early_exaggeration": [12],
+    "n_iter_like": [1000],     # lo traduzco luego a max_iter o n_iter según versión
+    "init": ["pca"],
+    "angle": [0.5],
+    "random_state": [42],
+}
 
 
 # =========================================================
@@ -86,51 +105,99 @@ def asignar_grupo(row):
 # =========================================================
 # HELPERS
 # =========================================================
-def build_tsne(perplexity, learning_rate):
+def subsample_indices(df_in, n, stratify=True, random_state=42):
     """
-    Construye TSNE compatible con distintas versiones de scikit-learn.
+    Devuelve índices de una submuestra. Si stratify=True, conserva
+    aproximadamente la composición por grupo_plot.
+    """
+    if n is None or n >= len(df_in):
+        return np.arange(len(df_in))
+
+    rng = np.random.default_rng(random_state)
+
+    if not stratify or "grupo_plot" not in df_in.columns:
+        return np.sort(rng.choice(len(df_in), size=n, replace=False))
+
+    temp = df_in.copy()
+    temp["_estrato"] = temp["grupo_plot"].fillna("Sin grupo")
+
+    idx_final = []
+    proporciones = temp["_estrato"].value_counts(normalize=True)
+    estratos = proporciones.index.tolist()
+    asignados = 0
+
+    for i, estrato in enumerate(estratos):
+        idx_estrato = temp.index[temp["_estrato"] == estrato].to_numpy()
+
+        if i < len(estratos) - 1:
+            k = int(round(proporciones[estrato] * n))
+            k = min(k, len(idx_estrato))
+        else:
+            k = n - asignados
+            k = min(k, len(idx_estrato))
+
+        if k > 0:
+            elegidos = rng.choice(idx_estrato, size=k, replace=False)
+            idx_final.extend(elegidos.tolist())
+            asignados += k
+
+    idx_final = np.array(sorted(idx_final))
+
+    if len(idx_final) < n:
+        faltan = n - len(idx_final)
+        restantes = np.setdiff1d(np.arange(len(df_in)), idx_final)
+        extra = rng.choice(restantes, size=faltan, replace=False)
+        idx_final = np.sort(np.concatenate([idx_final, extra]))
+    elif len(idx_final) > n:
+        idx_final = np.sort(rng.choice(idx_final, size=n, replace=False))
+
+    return idx_final
+
+
+def make_run_name(params):
+    parts = [
+        f"perp{params['perplexity']}",
+        f"lr{params['learning_rate']}",
+        f"ee{params['early_exaggeration']}",
+        f"iter{params['n_iter_like']}",
+        f"init{params['init']}",
+        f"ang{str(params['angle']).replace('.', '_')}",
+        f"seed{params['random_state']}",
+    ]
+    return "tsne_" + "_".join(parts)
+
+
+def build_tsne(params):
+    """
+    Construye un TSNE compatible con distintas versiones de scikit-learn.
+    Usa distancia euclídea sobre embeddings L2-normalizados; con eso,
+    el orden por distancia euclídea equivale al orden por coseno.
     """
     sig = inspect.signature(TSNE.__init__)
     valid_params = sig.parameters.keys()
 
     kwargs = {
         "n_components": 2,
-        "perplexity": perplexity,
-        "early_exaggeration": EARLY_EXAGGERATION,
-        "learning_rate": learning_rate,
-        "metric": "euclidean",   # sobre embeddings L2-normalizados
-        "init": INIT,
+        "perplexity": params["perplexity"],
+        "early_exaggeration": params["early_exaggeration"],
+        "learning_rate": params["learning_rate"],
+        "metric": "euclidean",
+        "init": params["init"],
         "verbose": 1,
-        "random_state": RANDOM_STATE,
+        "random_state": params["random_state"],
         "method": "barnes_hut",
-        "angle": ANGLE,
+        "angle": params["angle"],
     }
 
     if "max_iter" in valid_params:
-        kwargs["max_iter"] = N_ITER_LIKE
+        kwargs["max_iter"] = params["n_iter_like"]
     elif "n_iter" in valid_params:
-        kwargs["n_iter"] = N_ITER_LIKE
+        kwargs["n_iter"] = params["n_iter_like"]
 
     if "n_jobs" in valid_params:
         kwargs["n_jobs"] = -1
 
     return TSNE(**kwargs)
-
-
-def safe_trustworthiness(X_high, X_low, n_neighbors=15, max_n=5000, random_state=42):
-    """
-    Calcula trustworthiness sobre una submuestra para no volverlo demasiado pesado.
-    """
-    if len(X_high) > max_n:
-        rng = np.random.default_rng(random_state)
-        idx = rng.choice(len(X_high), size=max_n, replace=False)
-        Xh = X_high[idx]
-        Xl = X_low[idx]
-    else:
-        Xh = X_high
-        Xl = X_low
-
-    return trustworthiness(Xh, Xl, n_neighbors=n_neighbors)
 
 
 def plot_projection(
@@ -208,8 +275,21 @@ def plot_projection(
         plt.close(fig)
 
 
-def lr_to_str(lr):
-    return str(lr).replace(".", "_")
+def safe_trustworthiness(X_high, X_low, n_neighbors=15, max_n=5000, random_state=42):
+    """
+    Calcula trustworthiness sobre una submuestra si hace falta,
+    para no volver la corrida demasiado lenta.
+    """
+    if len(X_high) > max_n:
+        rng = np.random.default_rng(random_state)
+        idx = rng.choice(len(X_high), size=max_n, replace=False)
+        Xh = X_high[idx]
+        Xl = X_low[idx]
+    else:
+        Xh = X_high
+        Xl = X_low
+
+    return trustworthiness(Xh, Xl, n_neighbors=n_neighbors)
 
 
 # =========================================================
@@ -231,19 +311,28 @@ print(f"Dimensión de embeddings: {emb.shape[1]}")
 
 
 # =========================================================
-# FILTRO: SOLO 40 O MÁS PALABRAS
+# FILTROS OPCIONALES
 # =========================================================
-if "n_palabras" not in df.columns:
-    raise ValueError("La columna 'n_palabras' no existe en el metadata.")
+if FILTER_MIN_PALABRAS is not None:
+    if "n_palabras" not in df.columns:
+        raise ValueError("La columna 'n_palabras' no existe en el metadata.")
+    mask_len = df["n_palabras"] >= FILTER_MIN_PALABRAS
+    df = df.loc[mask_len].copy()
+    emb = emb[mask_len.to_numpy()]
+    print(f"Filtrado por n_palabras >= {FILTER_MIN_PALABRAS}: {len(df):,} filas")
 
-mask_len = df["n_palabras"] >= MIN_PALABRAS
-df = df.loc[mask_len].copy().reset_index(drop=True)
-emb = emb[mask_len.to_numpy()]
+if FILTER_PERIODOS is not None:
+    if "periodo" not in df.columns:
+        raise ValueError("La columna 'periodo' no existe en el metadata.")
+    mask_per = df["periodo"].isin(FILTER_PERIODOS)
+    df = df.loc[mask_per].copy()
+    emb = emb[mask_per.to_numpy()]
+    print(f"Filtrado por períodos {FILTER_PERIODOS}: {len(df):,} filas")
 
-print(f"Filas con n_palabras >= {MIN_PALABRAS}: {len(df):,}")
+df = df.reset_index(drop=True)
 
 if len(df) == 0:
-    raise ValueError("No quedaron filas tras aplicar el filtro.")
+    raise ValueError("No quedaron filas después de aplicar los filtros.")
 
 df["grupo_plot"] = df.apply(asignar_grupo, axis=1)
 
@@ -257,39 +346,56 @@ emb_norm = emb / norms
 
 
 # =========================================================
-# PCA PREVIA
+# SUBMUESTRA OPCIONAL
 # =========================================================
-if USE_PCA_PRE:
-    n_pca = min(PCA_DIM, emb_norm.shape[1], len(emb_norm))
-    print(f"Aplicando PCA previa a {n_pca} dimensiones...")
+idx_use = subsample_indices(
+    df_in=df,
+    n=SUBSAMPLE_N,
+    stratify=STRATIFY_BY_GROUP,
+    random_state=RANDOM_STATE_BASE,
+)
 
-    pca_pre = PCA(n_components=n_pca, random_state=RANDOM_STATE)
-    X_tsne_input = pca_pre.fit_transform(emb_norm)
+df_use = df.iloc[idx_use].copy().reset_index(drop=True)
+X_use = emb_norm[idx_use]
 
-    pca_var_exp = float(pca_pre.explained_variance_ratio_.sum())
-    print(f"Varianza explicada acumulada por PCA({n_pca}): {pca_var_exp:.4f}")
-else:
-    X_tsne_input = emb_norm
-    n_pca = None
-    pca_var_exp = np.nan
-    print("Sin PCA previa.")
+print(f"Filas para esta corrida: {len(df_use):,}")
 
 
 # =========================================================
-# LOOP: SOLO LEARNING RATE
+# PCA PREVIA A t-SNE
 # =========================================================
+n_pca = min(PCA_PRE_TSNE_DIM, X_use.shape[1], len(X_use))
+print(f"Aplicando PCA previa a {n_pca} dimensiones...")
+
+pca_pre = PCA(n_components=n_pca, random_state=RANDOM_STATE_BASE)
+X_use_pca = pca_pre.fit_transform(X_use)
+
+var_exp = pca_pre.explained_variance_ratio_.sum()
+print(f"Varianza explicada acumulada por PCA({n_pca}): {var_exp:.4f}")
+
+
+# =========================================================
+# LOOP PRINCIPAL
+# =========================================================
+param_names = list(PARAM_GRID.keys())
+param_combinations = list(product(*[PARAM_GRID[k] for k in param_names]))
+
+print(f"Cantidad de corridas planeadas: {len(param_combinations)}")
+
 results = []
 
-for learning_rate in LEARNING_RATES:
-    if PERPLEXITY >= len(X_tsne_input):
-        raise ValueError(
-            f"Perplexity={PERPLEXITY} debe ser menor que n_samples={len(X_tsne_input)}"
-        )
+for combo in param_combinations:
+    params = dict(zip(param_names, combo))
 
-    run_name = (
-        f"tsne_perp{PERPLEXITY}_lr{lr_to_str(learning_rate)}"
-        f"_ee{EARLY_EXAGGERATION}_min{MIN_PALABRAS}_seed{RANDOM_STATE}"
-    )
+    # t-SNE requiere perplexity < n_samples
+    if params["perplexity"] >= len(X_use):
+        print(
+            f"Salteo corrida porque perplexity={params['perplexity']} "
+            f"y n={len(X_use)}"
+        )
+        continue
+
+    run_name = make_run_name(params)
 
     print("\n" + "=" * 100)
     print(f"CORRIENDO: {run_name}")
@@ -297,39 +403,45 @@ for learning_rate in LEARNING_RATES:
 
     t0 = time.time()
 
-    tsne = build_tsne(perplexity=PERPLEXITY, learning_rate=learning_rate)
-    coords = tsne.fit_transform(X_tsne_input)
+    tsne = build_tsne(params)
+    coords = tsne.fit_transform(X_use_pca)
 
     elapsed = time.time() - t0
+
     kl = getattr(tsne, "kl_divergence_", np.nan)
 
     trust = safe_trustworthiness(
-        X_high=emb_norm,
+        X_high=X_use,
         X_low=coords,
         n_neighbors=TRUST_NEIGHBORS,
-        max_n=TRUST_MAX_N,
-        random_state=RANDOM_STATE,
+        max_n=TRUST_N,
+        random_state=params["random_state"],
     )
 
-    # Guardar coordenadas
-    df_coords = df.copy()
+    df_coords = df_use.copy()
     df_coords["tsne_x"] = coords[:, 0]
     df_coords["tsne_y"] = coords[:, 1]
 
     coords_path = OUT_DIR / "coords" / f"{run_name}.csv"
     df_coords.to_csv(coords_path, index=False)
 
-    # Título
+    filtro_txt = []
+    if FILTER_MIN_PALABRAS is not None:
+        filtro_txt.append(f"n_palabras>={FILTER_MIN_PALABRAS}")
+    if FILTER_PERIODOS is not None:
+        filtro_txt.append(f"periodos={FILTER_PERIODOS}")
+    filtro_txt = " | ".join(filtro_txt) if filtro_txt else "sin filtros"
+
     title = (
-        f"t-SNE | perplexity={PERPLEXITY} | learning_rate={learning_rate} | "
-        f"n={len(df):,} | n_palabras>={MIN_PALABRAS}\n"
-        f"KL={kl:.4f} | trustworthiness@{TRUST_NEIGHBORS}={trust:.4f}"
+        f"t-SNE | perplexity={params['perplexity']} | "
+        f"lr={params['learning_rate']} | init={params['init']} | "
+        f"seed={params['random_state']}\n"
+        f"KL={kl:.4f} | trustworthiness@{TRUST_NEIGHBORS}={trust:.4f} | "
+        f"n={len(df_use):,} | {filtro_txt}"
     )
 
-    # Plot color
     svg_color = OUT_DIR / "plots" / f"{run_name}_color.svg"
     png_color = OUT_DIR / "plots" / f"{run_name}_color.png" if SAVE_PNG else None
-
     plot_projection(
         df_plot=df_coords,
         x_col="tsne_x",
@@ -340,10 +452,8 @@ for learning_rate in LEARNING_RATES:
         color_by_group=True,
     )
 
-    # Plot gris
     svg_gray = OUT_DIR / "plots" / f"{run_name}_gray.svg"
     png_gray = OUT_DIR / "plots" / f"{run_name}_gray.png" if SAVE_PNG else None
-
     plot_projection(
         df_plot=df_coords,
         x_col="tsne_x",
@@ -354,38 +464,35 @@ for learning_rate in LEARNING_RATES:
         color_by_group=False,
     )
 
-    # Resumen
-    results.append({
+    row = {
         "run_name": run_name,
-        "n": len(df),
+        "n_total_post_filtros": len(df),
+        "n_usado": len(df_use),
         "embedding_dim": emb.shape[1],
-        "min_palabras": MIN_PALABRAS,
-        "perplexity": PERPLEXITY,
-        "learning_rate": learning_rate,
-        "early_exaggeration": EARLY_EXAGGERATION,
-        "n_iter_like": N_ITER_LIKE,
-        "init": INIT,
-        "angle": ANGLE,
-        "random_state": RANDOM_STATE,
-        "use_pca_pre": USE_PCA_PRE,
         "pca_pre_dim": n_pca,
-        "pca_var_explained": pca_var_exp,
+        "pca_var_explained": var_exp,
+        "filter_min_palabras": FILTER_MIN_PALABRAS,
+        "filter_periodos": None if FILTER_PERIODOS is None else ",".join(map(str, FILTER_PERIODOS)),
+        "perplexity": params["perplexity"],
+        "learning_rate": params["learning_rate"],
+        "early_exaggeration": params["early_exaggeration"],
+        "n_iter_like": params["n_iter_like"],
+        "init": params["init"],
+        "angle": params["angle"],
+        "random_state": params["random_state"],
         "kl_divergence": kl,
         "trustworthiness": trust,
         "runtime_sec": elapsed,
         "coords_csv": str(coords_path),
         "plot_svg_color": str(svg_color),
         "plot_svg_gray": str(svg_gray),
-    })
+    }
+    results.append(row)
 
     print(f"Tiempo: {elapsed:.1f} s")
     print(f"KL divergence: {kl:.6f}")
     print(f"Trustworthiness@{TRUST_NEIGHBORS}: {trust:.6f}")
 
-
-# =========================================================
-# GUARDAR RESUMEN FINAL
-# =========================================================
 df_results = pd.DataFrame(results)
 
 if not df_results.empty:
@@ -409,11 +516,13 @@ if not df_results.empty:
                 "run_name",
                 "perplexity",
                 "learning_rate",
+                "init",
+                "random_state",
                 "kl_divergence",
                 "trustworthiness",
                 "runtime_sec",
             ]
-        ]
+        ].head(20)
     )
 else:
     print("No hubo corridas válidas.")
