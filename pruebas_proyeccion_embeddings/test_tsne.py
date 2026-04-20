@@ -18,7 +18,7 @@ from sklearn.manifold import TSNE, trustworthiness
 EMB_PATH = "embeddings_intervenciones_spanish_es.npy"
 META_PATH = "embeddings_intervenciones_metadata.csv"
 
-OUT_DIR = Path("tsne_experimentos")
+OUT_DIR = Path("tsne_pruebas")
 OUT_DIR.mkdir(exist_ok=True)
 (OUT_DIR / "plots").mkdir(exist_ok=True)
 (OUT_DIR / "coords").mkdir(exist_ok=True)
@@ -27,19 +27,15 @@ OUT_DIR.mkdir(exist_ok=True)
 # =========================================================
 # CONFIGURACIÓN GENERAL
 # =========================================================
-
 FILTER_MIN_PALABRAS = 40
 
 # Filtrado opcional por período.
 # Ejemplo: [1946, 1947, 1948]
-
 FILTER_PERIODOS = None
 
-# Por si no se quiere usar todo.
-# Para correr todo, dejar None.
+# Usar TODOS los discursos que cumplen el filtro de longitud.
+# Como no hay submuestra, no corresponde estratificar.
 SUBSAMPLE_N = None
-
-# Estratificar por grupo para que una submuestra conserve la composición. Si no hay submuestra va False
 STRATIFY_BY_GROUP = False
 
 # PCA previa a t-SNE
@@ -107,8 +103,9 @@ def asignar_grupo(row):
 # =========================================================
 def subsample_indices(df_in, n, stratify=True, random_state=42):
     """
-    Devuelve índices de una submuestra. Si stratify=True, conserva
-    aproximadamente la composición por grupo_plot.
+    Devuelve índices de una submuestra. Si n=None o n >= len(df_in),
+    devuelve todos los casos. Si stratify=True, conserva aproximadamente
+    la composición por grupo_plot.
     """
     if n is None or n >= len(df_in):
         return np.arange(len(df_in))
@@ -207,56 +204,43 @@ def plot_projection(
     title,
     save_svg_path=None,
     save_png_path=None,
-    color_by_group=True,
 ):
     fig, ax = plt.subplots(figsize=(16, 12))
 
-    if color_by_group:
-        mask_sin = df_plot["grupo_plot"].isna()
-        if mask_sin.any():
-            ax.scatter(
-                df_plot.loc[mask_sin, x_col],
-                df_plot.loc[mask_sin, y_col],
-                s=5,
-                c="#d9d9d9",
-                alpha=0.35,
-                linewidths=0,
-                zorder=1,
-            )
-
-        handles = []
-
-        for grupo in GRUPO_ORDER:
-            sub = df_plot[df_plot["grupo_plot"] == grupo]
-            if sub.empty:
-                continue
-
-            ax.scatter(
-                sub[x_col],
-                sub[y_col],
-                s=6,
-                c=color_map[grupo],
-                alpha=0.65,
-                linewidths=0,
-                zorder=2,
-            )
-            handles.append(
-                Patch(facecolor=color_map[grupo], edgecolor="none", label=grupo)
-            )
-
-        if handles:
-            ax.legend(handles=handles, title="Grupo", loc="best")
-
-    else:
+    mask_sin = df_plot["grupo_plot"].isna()
+    if mask_sin.any():
         ax.scatter(
-            df_plot[x_col],
-            df_plot[y_col],
+            df_plot.loc[mask_sin, x_col],
+            df_plot.loc[mask_sin, y_col],
             s=5,
-            c="#7f7f7f",
-            alpha=0.45,
+            c="#d9d9d9",
+            alpha=0.35,
             linewidths=0,
             zorder=1,
         )
+
+    handles = []
+
+    for grupo in GRUPO_ORDER:
+        sub = df_plot[df_plot["grupo_plot"] == grupo]
+        if sub.empty:
+            continue
+
+        ax.scatter(
+            sub[x_col],
+            sub[y_col],
+            s=6,
+            c=color_map[grupo],
+            alpha=0.65,
+            linewidths=0,
+            zorder=2,
+        )
+        handles.append(
+            Patch(facecolor=color_map[grupo], edgecolor="none", label=grupo)
+        )
+
+    if handles:
+        ax.legend(handles=handles, title="Grupo", loc="best")
 
     ax.set_xlabel("t-SNE 1")
     ax.set_ylabel("t-SNE 2")
@@ -449,19 +433,6 @@ for combo in param_combinations:
         title=title,
         save_svg_path=svg_color,
         save_png_path=png_color,
-        color_by_group=True,
-    )
-
-    svg_gray = OUT_DIR / "plots" / f"{run_name}_gray.svg"
-    png_gray = OUT_DIR / "plots" / f"{run_name}_gray.png" if SAVE_PNG else None
-    plot_projection(
-        df_plot=df_coords,
-        x_col="tsne_x",
-        y_col="tsne_y",
-        title=title,
-        save_svg_path=svg_gray,
-        save_png_path=png_gray,
-        color_by_group=False,
     )
 
     row = {
@@ -485,7 +456,6 @@ for combo in param_combinations:
         "runtime_sec": elapsed,
         "coords_csv": str(coords_path),
         "plot_svg_color": str(svg_color),
-        "plot_svg_gray": str(svg_gray),
     }
     results.append(row)
 
